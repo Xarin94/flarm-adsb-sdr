@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="it">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Pluto ADS-B Tracker</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+    <link rel="stylesheet" href="/style.css">
+    <script defer src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script defer src="/app.js"></script>
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="topbar">
+        <div class="identity">
+          <span class="kicker">PLUTO SDR</span>
+          <h1>ADS-B / 1090 MHz</h1>
+        </div>
+        <div class="protocol-controls" aria-label="Selezione protocollo">
+          <span class="protocol-label">PROTOCOLLO</span>
+          <label class="protocol-check"><input id="protoAdsb" type="checkbox" checked> ADS-B</label>
+          <label class="protocol-check"><input id="protoFlarm" type="checkbox" checked> FLARM</label>
+        </div>
+        <div class="source-controls" aria-label="Controllo sorgente">
+          <button id="connectPlutoBtn" type="button">CONNETTI PLUTO</button>
+          <button id="simModeBtn" type="button">SIM</button>
+          <span id="controlStatus">Pronto</span>
+        </div>
+        <div class="status-strip" aria-label="Stato ricezione">
+          <div>
+            <span class="label">RX</span>
+            <strong id="rxState">INIT</strong>
+          </div>
+          <div>
+            <span class="label">SRC</span>
+            <strong id="sourceName">-</strong>
+          </div>
+          <div>
+            <span class="label">MSG/S</span>
+            <strong id="msgRate">0</strong>
+          </div>
+          <div>
+            <span class="label">TRACKS</span>
+            <strong id="trackCount">0</strong>
+          </div>
+        </div>
+      </header>
+
+      <main class="mission-grid">
+        <section class="map-stage" aria-label="Mappa traffici">
+          <div id="map"></div>
+          <div id="mapFallback" class="map-fallback" hidden>Leaflet non disponibile</div>
+          <canvas id="aircraftDetails" width="1200" height="104" aria-label="Dati aereo selezionato"></canvas>
+        </section>
+
+        <aside class="telemetry-rail" aria-label="Telemetria ricevitore">
+          <section class="instrument spectrum-panel" data-protocol="adsb">
+            <div class="instrument-head">
+              <h2>ADS-B SPETTRO</h2>
+              <span id="rfConfig">4.0 MS/s · 2.8 MHz</span>
+            </div>
+            <div class="spectrum-control-row">
+              <canvas id="spectrum" width="720" height="180"></canvas>
+              <div class="gain-slider-wrap">
+                <input id="gainSlider" type="range" min="5" max="52" step="0.5" value="35" aria-label="Gain RX">
+                <span id="gainSliderValue">35 dB</span>
+              </div>
+            </div>
+          </section>
+
+          <section class="instrument waterfall-panel" data-protocol="adsb">
+            <div class="instrument-head">
+              <h2>ADS-B WATERFALL</h2>
+              <span id="noiseFloor">NF -</span>
+            </div>
+            <canvas id="waterfall" width="720" height="360"></canvas>
+          </section>
+
+          <section class="instrument spectrum-panel" data-protocol="flarm">
+            <div class="instrument-head">
+              <h2>FLARM SPETTRO</h2>
+              <span id="flarmRfConfig">RX1</span>
+            </div>
+            <canvas id="flarmSpectrum" width="720" height="180"></canvas>
+          </section>
+
+          <section class="instrument waterfall-panel" data-protocol="flarm">
+            <div class="instrument-head">
+              <h2>FLARM WATERFALL</h2>
+              <span id="flarmNoiseFloor">RX1</span>
+            </div>
+            <canvas id="flarmWaterfall" width="720" height="360"></canvas>
+          </section>
+
+          <section class="instrument decode-panel">
+            <div class="decode-wrap">
+              <canvas id="decodeCircle" width="160" height="160"></canvas>
+              <div class="decode-readout">
+                <span>CRC OK</span>
+                <strong id="crcOk">0</strong>
+                <span>CRC BAD</span>
+                <strong id="crcBad">0</strong>
+              </div>
+            </div>
+            <div class="gain-row">
+              <span>GAIN</span>
+              <strong id="gainReadout">-</strong>
+              <span>CLIP</span>
+              <strong id="clipReadout">0.000%</strong>
+            </div>
+          </section>
+
+          <section class="instrument iq-panel">
+            <div class="instrument-head">
+              <h2>DECODIFICA I/Q</h2>
+              <span id="iqInfo">- pt</span>
+            </div>
+            <canvas id="iqScope" width="320" height="320"></canvas>
+          </section>
+
+          <span id="lastUpdate" class="last-update">-</span>
+        </aside>
+      </main>
+    </div>
+  </body>
+</html>

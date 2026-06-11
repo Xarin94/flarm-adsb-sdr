@@ -1,0 +1,64 @@
+{
+  "name": "pluto-adsb-tracker",
+  "version": "0.1.0",
+  "description": "Desktop Electron shell for the Pluto ADS-B/FLARM tracker.",
+  "main": "electron/main.js",
+  "private": true,
+  "scripts": {
+    "start": "node electron/start.js",
+    "start:sim": "node electron/start.js --source sim",
+    "start:pluto": "node electron/start.js --source pluto",
+    "start:pluto:fast": "node electron/start.js --source pluto --ui-rate-hz 20",
+    "backend:sim": "node electron/run-python.js --source sim --host 127.0.0.1 --port 8080",
+    "backend:pluto": "node electron/run-python.js --source pluto --host 127.0.0.1 --port 8080",
+    "backend:pluto:fast": "node electron/run-python.js --source pluto --host 127.0.0.1 --port 8080 --ui-rate-hz 20",
+    "self-test": "node electron/run-python.js --self-test",
+    "build:backend": "python -m PyInstaller --clean --noconfirm pluto_adsb_backend.spec",
+    "dist": "npm run build:backend && electron-builder --win portable --x64"
+  },
+  "build": {
+    "appId": "local.pluto.adsb.tracker",
+    "productName": "Pluto ADS-B Tracker",
+    "asar": true,
+    "files": [
+      "electron/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "dist/pluto-adsb-backend",
+        "to": "backend/pluto-adsb-backend"
+      },
+      {
+        "from": "static",
+        "to": "static"
+      },
+      {
+        "from": "pluto_adsb_tracker.py",
+        "to": "pluto_adsb_tracker.py"
+      },
+      {
+        "from": "flarm_legacy.py",
+        "to": "flarm_legacy.py"
+      },
+      {
+        "from": "requirements.txt",
+        "to": "requirements.txt"
+      }
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
+    }
+  },
+  "devDependencies": {
+    "electron": "^35.0.0",
+    "electron-builder": "^26.15.2"
+  }
+}

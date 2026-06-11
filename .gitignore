@@ -1,0 +1,12 @@
+node_modules/
+.venv/
+venv/
+dist/
+build/
+out/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+*.log
+__pycache__/
+*.pyc
