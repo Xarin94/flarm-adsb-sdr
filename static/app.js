@@ -19,6 +19,19 @@ const ALTITUDE_COLOR_STOPS = [
   { at: 1.0, rgb: [184, 88, 255] },
 ];
 
+// Animazione dead-reckoning: proietta la posizione con velocita'/prua tra un
+// messaggio e l'altro, correggendo dolcemente quando arriva un fix reale.
+const EXTRAP_MAX_S = 14;          // oltre, congela la predizione
+const FADE_START_S = 8;           // inizia a sfumare il marker predetto
+const FADE_END_S = 22;            // opacita' minima raggiunta qui
+const FADE_MIN_OPACITY = 0.32;
+const SMOOTH_TAU_S = 0.35;        // costante di tempo della correzione morbida
+const METERS_PER_DEG_LAT = 111320;
+const KT_TO_MS = 0.514444;
+const FT_MIN_TO_MS = 0.00508;
+// Sagoma aereo (vista dall'alto) orientata a Nord, viewBox 0 0 24 24.
+const PLANE_PATH = "M12 2 C12.6 2 13 2.7 13 4 L13 10 L21 15 L21 16.5 L13 14 L13 19 L15.4 20.6 L15.4 21.7 L12 20.7 L8.6 21.7 L8.6 20.6 L11 19 L11 14 L3 16.5 L3 15 L11 10 L11 4 C11 2.7 11.4 2 12 2 Z";
+
 const state = {
   map: null,
   vectorRenderer: null,
@@ -33,6 +46,7 @@ const state = {
   lastStats: null,
   gainSendTimer: null,
   lastIq: [],
+  animationRafId: null,
 };
 
 const els = {};
@@ -43,6 +57,7 @@ document.addEventListener("DOMContentLoaded", () => {
   initControls();
   initWaterfallTicker();
   initStream();
+  startAnimation();
   requestInitialStatus();
   window.addEventListener("resize", () => {
     drawSpectrum([], els.spectrum);
@@ -432,28 +447,26 @@ function trackKey(track) {
 }
 
 function createTrackLayer(track) {
-  const position = L.latLng(track.lat, track.lon);
   const trailPoints = normalizeTrail(track);
   const trail = L.layerGroup().addTo(state.map);
   updateTrailLayer(trail, track, trailPoints);
 
-  const target = L.circleMarker(position, {
-    ...targetStyle(track, state.selectedTrackKey === trackKey(track), trailPoints),
-    className: "aircraft-target",
-    renderer: state.vectorRenderer,
+  const target = L.marker([track.lat, track.lon], {
+    icon: makeAircraftIcon(track, state.selectedTrackKey === trackKey(track)),
     interactive: true,
+    keyboard: false,
     bubblingMouseEvents: false,
   }).addTo(state.map);
 
   target.bindTooltip(trackLabelHtml(track), {
     permanent: true,
     direction: "right",
-    offset: [8, 0],
+    offset: [14, 0],
     className: trackLabelClass(track),
     interactive: false,
   });
 
-  const layer = { target, trail, offsets: null, track };
+  const layer = { target, trail, track, kin: null, iconSig: null };
   target.on("click", (event) => {
     if (event.originalEvent) {
       L.DomEvent.stopPropagation(event.originalEvent);
@@ -461,25 +474,54 @@ function createTrackLayer(track) {
     }
     selectTrack(layer.track);
   });
-  updateTargetClass(layer);
-  evaluateDisplayOffsets(layer, position, trailPoints);
+  updateKinematics(layer, track);
   return layer;
 }
 
 function updateTrackLayer(layer, track) {
-  const position = L.latLng(track.lat, track.lon);
-  const trailPoints = normalizeTrail(track);
   layer.track = track;
-  updateTrailLayer(layer.trail, track, trailPoints);
-  layer.target.setLatLng(position);
-  layer.target.setStyle(targetStyle(track, state.selectedTrackKey === trackKey(track), trailPoints));
+  updateTrailLayer(layer.trail, track);
+  applyIcon(layer);
   if (layer.target.getTooltip()) layer.target.setTooltipContent(trackLabelHtml(track));
-  updateTargetClass(layer);
+  updateKinematics(layer, track);
   if (state.selectedTrackKey === trackKey(track)) {
     state.selectedTrack = track;
     scheduleAircraftDetailsDraw(track);
   }
-  evaluateDisplayOffsets(layer, position, trailPoints);
+}
+
+function makeAircraftIcon(track, selected) {
+  const color = trackColor(track);
+  const headingDeg = Number(track.track_deg);
+  const hasHeading = Number.isFinite(headingDeg);
+  const size = selected ? 30 : 22;
+  const classes = `aircraft-target${selected ? " selected" : ""}${String(track.protocol || "adsb") === "flarm" ? " flarm" : ""}`;
+  let glyph;
+  if (hasHeading) {
+    glyph = `<div class="ac-rot" style="transform:rotate(${headingDeg.toFixed(1)}deg)"><svg viewBox="0 0 24 24" width="${size}" height="${size}"><path d="${PLANE_PATH}" fill="${color}" stroke="rgba(0,0,0,0.7)" stroke-width="1"/></svg></div>`;
+  } else {
+    const r = selected ? 6 : 4.5;
+    glyph = `<div class="ac-rot"><svg viewBox="0 0 24 24" width="${size}" height="${size}"><circle cx="12" cy="12" r="${r}" fill="${color}" stroke="rgba(0,0,0,0.6)" stroke-width="1"/></svg></div>`;
+  }
+  return L.divIcon({
+    html: glyph,
+    className: classes,
+    iconSize: [size, size],
+    iconAnchor: [size / 2, size / 2],
+  });
+}
+
+function applyIcon(layer) {
+  const track = layer.track;
+  const selected = state.selectedTrackKey === trackKey(track);
+  const color = trackColor(track);
+  const headingDeg = Number.isFinite(Number(track.track_deg)) ? Math.round(Number(track.track_deg)) : null;
+  // Ricostruisce l'icona solo quando cambia davvero (colore/prua/selezione):
+  // evita di azzerare l'opacita' del fade e di stressare il DOM a ogni snapshot.
+  const signature = `${color}|${headingDeg}|${selected}`;
+  if (layer.iconSig === signature) return;
+  layer.iconSig = signature;
+  layer.target.setIcon(makeAircraftIcon(track, selected));
 }
 
 function removeTrackLayer(layer) {
@@ -498,22 +540,85 @@ function trackLabelClass(track) {
   return `aircraft-label-tooltip${String(track.protocol || "adsb") === "flarm" ? " flarm" : ""}`;
 }
 
-function targetStyle(track, selected = false, trailPoints = null) {
-  const color = trackColor(track, trailPoints);
-  return {
-    radius: selected ? 8 : 5,
-    color,
-    weight: selected ? 2.5 : 1.5,
-    fillColor: color,
-    fillOpacity: selected ? 0.48 : 0.28,
-    opacity: 0.95,
+function updateKinematics(layer, track) {
+  const nowPerf = performance.now();
+  const ageS = Number(track.last_position_age);
+  const fixClientT = nowPerf - (Number.isFinite(ageS) ? ageS * 1000 : 0);
+  const speedKt = Number(track.speed_kt);
+  const speedMs = Number.isFinite(speedKt) ? Math.max(0, speedKt) * KT_TO_MS : 0;
+  const headingDeg = Number(track.track_deg);
+  const hasHeading = Number.isFinite(headingDeg);
+  const prev = layer.kin;
+  layer.kin = {
+    fixLat: track.lat,
+    fixLon: track.lon,
+    speedMs,
+    headingDeg: hasHeading ? headingDeg : null,
+    headingRad: hasHeading ? (headingDeg * Math.PI) / 180 : null,
+    fixClientT,
+    rLat: prev ? prev.rLat : track.lat,
+    rLon: prev ? prev.rLon : track.lon,
+    hasRender: prev ? prev.hasRender : true,
+    lastFrameT: prev ? prev.lastFrameT : nowPerf,
   };
 }
 
-function updateTargetClass(layer) {
-  const element = layer.target.getElement?.();
-  if (!element || !layer.track) return;
-  element.classList.toggle("selected", state.selectedTrackKey === trackKey(layer.track));
+function predictedTarget(kin, nowPerf) {
+  let elapsed = (nowPerf - kin.fixClientT) / 1000;
+  if (!Number.isFinite(elapsed) || elapsed < 0) elapsed = 0;
+  const used = Math.min(elapsed, EXTRAP_MAX_S);
+  let tLat = kin.fixLat;
+  let tLon = kin.fixLon;
+  if (kin.speedMs > 0.5 && kin.headingRad !== null) {
+    const dist = kin.speedMs * used;
+    const dNorth = dist * Math.cos(kin.headingRad);
+    const dEast = dist * Math.sin(kin.headingRad);
+    const cosLat = Math.max(0.01, Math.cos((kin.fixLat * Math.PI) / 180));
+    tLat = kin.fixLat + dNorth / METERS_PER_DEG_LAT;
+    tLon = kin.fixLon + dEast / (METERS_PER_DEG_LAT * cosLat);
+  }
+  return { tLat, tLon, elapsed };
+}
+
+function startAnimation() {
+  if (state.animationRafId) return;
+  const tick = () => {
+    state.animationRafId = window.requestAnimationFrame(tick);
+    tickAnimation();
+  };
+  tick();
+}
+
+function tickAnimation() {
+  if (!state.map || state.tracks.size === 0) return;
+  const nowPerf = performance.now();
+  for (const layer of state.tracks.values()) {
+    const kin = layer.kin;
+    if (!kin) continue;
+    const dt = Math.min(0.25, Math.max(0, (nowPerf - kin.lastFrameT) / 1000));
+    kin.lastFrameT = nowPerf;
+    const { tLat, tLon, elapsed } = predictedTarget(kin, nowPerf);
+    if (!kin.hasRender) {
+      kin.rLat = tLat;
+      kin.rLon = tLon;
+      kin.hasRender = true;
+    } else {
+      const alpha = 1 - Math.exp(-dt / SMOOTH_TAU_S);
+      kin.rLat += (tLat - kin.rLat) * alpha;
+      kin.rLon += (tLon - kin.rLon) * alpha;
+    }
+    layer.target.setLatLng([kin.rLat, kin.rLon]);
+
+    const element = layer.target.getElement?.();
+    if (element) {
+      let opacity = 1;
+      if (elapsed > FADE_START_S) {
+        const f = Math.min(1, (elapsed - FADE_START_S) / (FADE_END_S - FADE_START_S));
+        opacity = 1 - f * (1 - FADE_MIN_OPACITY);
+      }
+      element.style.opacity = opacity.toFixed(2);
+    }
+  }
 }
 
 function selectTrack(track) {
@@ -522,10 +627,7 @@ function selectTrack(track) {
     state.selectedTrackKey = null;
     state.selectedTrack = null;
     const previousLayer = previousKey ? state.tracks.get(previousKey) : null;
-    if (previousLayer) {
-      previousLayer.target.setStyle(targetStyle(previousLayer.track, false));
-      updateTargetClass(previousLayer);
-    }
+    if (previousLayer) applyIcon(previousLayer);
     scheduleAircraftDetailsDraw(null);
     return;
   }
@@ -536,17 +638,11 @@ function selectTrack(track) {
 
   if (previousKey && previousKey !== key) {
     const previousLayer = state.tracks.get(previousKey);
-    if (previousLayer) {
-      previousLayer.target.setStyle(targetStyle(previousLayer.track, false));
-      updateTargetClass(previousLayer);
-    }
+    if (previousLayer) applyIcon(previousLayer);
   }
 
   const currentLayer = state.tracks.get(key);
-  if (currentLayer) {
-    currentLayer.target.setStyle(targetStyle(track, true));
-    updateTargetClass(currentLayer);
-  }
+  if (currentLayer) applyIcon(currentLayer);
   scheduleAircraftDetailsDraw(track);
 }
 
@@ -675,23 +771,6 @@ function interpolateRgb(a, b, mix) {
 
 function rgbToHex(rgb) {
   return `#${rgb.map((value) => value.toString(16).padStart(2, "0")).join("")}`;
-}
-
-function evaluateDisplayOffsets(layer, position, trailPoints) {
-  if (!state.map || !trailPoints.length) return;
-  const targetPoint = state.map.latLngToLayerPoint(position);
-  const trailEndPoint = state.map.latLngToLayerPoint(trailPoints[trailPoints.length - 1].latLng);
-  const targetLatLng = layer.target.getLatLng();
-  const targetVsTrailPx = targetPoint.distanceTo(trailEndPoint);
-  const targetVsLayerPx = targetPoint.distanceTo(state.map.latLngToLayerPoint(targetLatLng));
-  layer.offsets = {
-    targetVsTrailPx,
-    targetVsLayerPx,
-    trailPoints: trailPoints.length,
-  };
-  if (targetVsTrailPx > 1.5 || targetVsLayerPx > 1.5) {
-    console.warn("Offset mappa", layer.offsets);
-  }
 }
 
 function renderTrackList(tracks) {

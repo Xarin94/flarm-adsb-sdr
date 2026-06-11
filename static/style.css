@@ -308,6 +308,32 @@ body {
   pointer-events: auto !important;
 }
 
+/* Icone aereo (divIcon nel marker pane): cliccabili anche se il pane e' off. */
+.aircraft-target.leaflet-div-icon {
+  background: transparent;
+  border: 0;
+  cursor: pointer;
+  pointer-events: auto !important;
+  transition: opacity 0.2s linear;
+}
+
+.aircraft-target .ac-rot {
+  width: 100%;
+  height: 100%;
+  transform-origin: 50% 50%;
+  transition: transform 0.25s linear;
+  will-change: transform;
+}
+
+.aircraft-target svg {
+  display: block;
+  filter: drop-shadow(0 1px 2px rgba(0, 0, 0, 0.65));
+}
+
+.aircraft-target.selected svg {
+  filter: drop-shadow(0 0 5px rgba(113, 217, 255, 0.95));
+}
+
 .aircraft-label-tooltip,
 .aircraft-label-tooltip.leaflet-tooltip {
   margin: 0;

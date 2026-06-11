@@ -803,6 +803,7 @@ class AirTrafficTracker:
         protocol: str = PROTOCOL_ADSB,
         speed_kt: Optional[float] = None,
         vertical_ft_min: Optional[float] = None,
+        track_deg: Optional[float] = None,
     ) -> None:
         now = timestamp if timestamp is not None else utc_now()
         with self.lock:
@@ -814,6 +815,8 @@ class AirTrafficTracker:
             track.callsign = callsign
             track.last_seen = now
             track.rssi = rssi
+            if track_deg is not None and math.isfinite(track_deg):
+                track.track_deg = float(track_deg)
             self._set_position(
                 track,
                 lat,
@@ -1669,6 +1672,7 @@ class PlutoReceiver(threading.Thread):
                 protocol=PROTOCOL_FLARM,
                 speed_kt=target.speed_kt,
                 vertical_ft_min=target.vs_ft_min,
+                track_deg=target.course_deg,
             )
         self.stats.record_flarm_decode(
             flarm_batch.bursts,
@@ -1837,6 +1841,7 @@ class SimulatedReceiver(threading.Thread):
                         rssi=random.uniform(8.0, 35.0),
                         speed_kt=aircraft.speed_kt,
                         vertical_ft_min=aircraft.vertical_ft_min,
+                        track_deg=aircraft.heading_deg,
                     )
                     message_count += random.randint(2, 5)
 
@@ -1855,6 +1860,7 @@ class SimulatedReceiver(threading.Thread):
                         protocol=PROTOCOL_FLARM,
                         speed_kt=aircraft.speed_kt,
                         vertical_ft_min=aircraft.vertical_ft_min,
+                        track_deg=aircraft.heading_deg,
                     )
                     flarm_count += random.randint(1, 3)
 
