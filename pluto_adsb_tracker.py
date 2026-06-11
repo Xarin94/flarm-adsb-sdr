@@ -54,6 +54,7 @@ TRACK_TTL_S = 120.0
 TRACK_TRAIL_TTL_S = 120.0
 CPR_MAX_PAIR_AGE_S = 10.0
 CPR_SCALE = 131072.0
+LOCAL_CPR_MAX_RANGE_KM = 463.0  # ~250 NM: oltre il raggio 1090, fix locale ambiguo
 MIN_TRACK_JUMP_GATE_KM = 8.0
 MAX_TRACK_SPEED_KM_S = 1.2
 KNOTS_PER_M_S = 1.943844
@@ -254,6 +255,35 @@ def mode_s_parity(payload: bytes, bit_count: int = 112) -> int:
     return remainder & 0xFFFFFF
 
 
+def _build_single_bit_syndromes() -> dict[int, int]:
+    """Mappa sindrome CRC -> indice del bit errato, per la correzione a 1 bit.
+
+    Il CRC Mode-S e' lineare: crc(ricevuto) = crc(originale) XOR crc(errore).
+    Per un frame valido crc(originale)=0, quindi la sindrome di un errore di un
+    singolo bit i e' crc(e_i), con e_i = frame con solo il bit i a 1. Il DF17/18
+    usa parita' pura (nessun overlay dell'indirizzo), quindi la correzione e' lecita.
+    """
+    table: dict[int, int] = {}
+    for i in range(112):
+        err = bytearray(14)
+        err[i // 8] = 1 << (7 - (i % 8))
+        table[mode_s_crc(bytes(err), 112)] = i
+    return table
+
+
+SINGLE_BIT_SYNDROMES = _build_single_bit_syndromes()
+
+
+def correct_single_bit(frame: bytes, syndrome: int) -> Optional[bytes]:
+    """Corregge un errore di un singolo bit se la sindrome lo identifica."""
+    bit = SINGLE_BIT_SYNDROMES.get(syndrome)
+    if bit is None:
+        return None
+    corrected = bytearray(frame)
+    corrected[bit // 8] ^= 1 << (7 - (bit % 8))
+    return bytes(corrected)
+
+
 def decode_ac12_altitude(ac12: int) -> Optional[int]:
     """Decode a 12-bit ADS-B airborne altitude field with Q-bit set."""
     if not (ac12 & 0x10):
@@ -333,6 +363,36 @@ def decode_global_cpr(
     return lat, lon
 
 
+def decode_local_cpr(
+    cpr_lat: int,
+    cpr_lon: int,
+    cpr_format: int,
+    ref_lat: float,
+    ref_lon: float,
+) -> Optional[tuple[float, float]]:
+    """Decodifica CPR locale: posizione da un singolo messaggio usando una
+    posizione di riferimento nota (la stazione). Non ambiguo se la posizione
+    reale e' entro ~half-zone dal riferimento (vale per il raggio 1090)."""
+    nz = 15
+    dlat = 360.0 / (4 * nz - cpr_format)
+    yz = cpr_lat / CPR_SCALE
+    j = math.floor(ref_lat / dlat) + math.floor(0.5 + ((ref_lat % dlat) / dlat) - yz)
+    lat = dlat * (j + yz)
+
+    nl = cpr_nl(lat)
+    ni = max(nl - cpr_format, 1)
+    dlon = 360.0 / ni
+    xz = cpr_lon / CPR_SCALE
+    m = math.floor(ref_lon / dlon) + math.floor(0.5 + ((ref_lon % dlon) / dlon) - xz)
+    lon = dlon * (m + xz)
+    if lon >= 180.0:
+        lon -= 360.0
+
+    if not (-90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0):
+        return None
+    return lat, lon
+
+
 CALLSIGN_CHARS = "#ABCDEFGHIJKLMNOPQRSTUVWXYZ#####_###############0123456789######"
 
 
@@ -349,6 +409,9 @@ class DecodedMessage:
     cpr_lat: Optional[int] = None
     cpr_lon: Optional[int] = None
     rssi: Optional[float] = None
+    speed_kt: Optional[float] = None
+    track_deg: Optional[float] = None
+    vertical_rate_fpm: Optional[float] = None
 
 
 def decode_callsign(me: bytes) -> str:
@@ -360,6 +423,46 @@ def decode_callsign(me: bytes) -> str:
         char = CALLSIGN_CHARS[code] if code < len(CALLSIGN_CHARS) else "#"
         chars.append(" " if char in "#_" else char)
     return "".join(chars).strip()
+
+
+def decode_airborne_velocity(me: bytes) -> tuple[Optional[float], Optional[float], Optional[float]]:
+    """Decodifica un messaggio Airborne Velocity (TC=19).
+
+    Ritorna (velocita_kt, rotta_gradi, rateo_verticale_ft_min). I campi non
+    disponibili nel sottotipo sono None. Sottotipi 1/2 = ground speed,
+    3/4 = airspeed + heading (usati quando manca la velocita' GNSS).
+    """
+    value = int.from_bytes(me, "big")  # 56 bit
+    subtype = (value >> 48) & 0x07
+    mult = 4.0 if subtype in (2, 4) else 1.0
+
+    speed_kt: Optional[float] = None
+    track_deg: Optional[float] = None
+
+    if subtype in (1, 2):  # ground speed
+        ew_dir = (value >> 42) & 1
+        ew_vel = (value >> 32) & 0x3FF
+        ns_dir = (value >> 31) & 1
+        ns_vel = (value >> 21) & 0x3FF
+        if ew_vel and ns_vel:
+            v_ew = (ew_vel - 1) * mult * (-1.0 if ew_dir else 1.0)
+            v_ns = (ns_vel - 1) * mult * (-1.0 if ns_dir else 1.0)
+            speed_kt = math.hypot(v_ew, v_ns)
+            track_deg = math.degrees(math.atan2(v_ew, v_ns)) % 360.0
+    elif subtype in (3, 4):  # airspeed + heading
+        if (value >> 42) & 1:  # heading available
+            track_deg = ((value >> 32) & 0x3FF) / 1024.0 * 360.0
+        airspeed = (value >> 21) & 0x3FF
+        if airspeed:
+            speed_kt = (airspeed - 1) * mult
+
+    vr_sign = (value >> 19) & 1
+    vr_raw = (value >> 10) & 0x1FF
+    vertical_fpm: Optional[float] = None
+    if vr_raw:
+        vertical_fpm = (vr_raw - 1) * 64.0 * (-1.0 if vr_sign else 1.0)
+
+    return speed_kt, track_deg, vertical_fpm
 
 
 def parse_adsb_frame(frame: bytes, timestamp: Optional[float] = None, rssi: Optional[float] = None) -> Optional[DecodedMessage]:
@@ -386,6 +489,10 @@ def parse_adsb_frame(frame: bytes, timestamp: Optional[float] = None, rssi: Opti
         decoded.callsign = decode_callsign(me)
         return decoded
 
+    if type_code == 19:
+        decoded.speed_kt, decoded.track_deg, decoded.vertical_rate_fpm = decode_airborne_velocity(me)
+        return decoded
+
     if 9 <= type_code <= 18 or 20 <= type_code <= 22:
         ac12 = ((frame[5] << 4) | (frame[6] >> 4)) & 0x0FFF
         decoded.altitude_ft = decode_ac12_altitude(ac12)
@@ -403,6 +510,7 @@ class DecodeBatch:
     preambles: int = 0
     crc_ok: int = 0
     crc_bad: int = 0
+    crc_corrected: int = 0
     noise_floor: float = 0.0
     clip_ratio: float = 0.0
 
@@ -460,7 +568,16 @@ class ADSBDecoder:
                 continue
             self.recent_frames[raw] = now
 
-            if mode_s_crc(frame, 112) == 0:
+            syndrome = mode_s_crc(frame, 112)
+            if syndrome != 0:
+                # Correzione a 1 bit: accetta solo se il frame risultante e' un DF17/18 plausibile.
+                fixed = correct_single_bit(frame, syndrome)
+                if fixed is not None and (fixed[0] >> 3) in (17, 18):
+                    frame = fixed
+                    syndrome = 0
+                    batch.crc_corrected += 1
+
+            if syndrome == 0:
                 batch.crc_ok += 1
                 decoded = parse_adsb_frame(frame, now, confidence)
                 if decoded is not None:
@@ -613,13 +730,21 @@ class Track:
     rssi: Optional[float] = None
     speed_kt: Optional[float] = None
     vertical_ft_min: Optional[float] = None
+    track_deg: Optional[float] = None
     speed_source: str = ""
     vertical_source: str = ""
 
 
 class AirTrafficTracker:
-    def __init__(self, ttl_s: float = TRACK_TTL_S) -> None:
+    def __init__(
+        self,
+        ttl_s: float = TRACK_TTL_S,
+        ref_lat: Optional[float] = None,
+        ref_lon: Optional[float] = None,
+    ) -> None:
         self.ttl_s = ttl_s
+        self.ref_lat = ref_lat
+        self.ref_lon = ref_lon
         self.lock = threading.Lock()
         self.tracks: dict[str, Track] = {}
 
@@ -639,6 +764,16 @@ class AirTrafficTracker:
             if message.rssi is not None:
                 track.rssi = message.rssi
 
+            # Velocita' riportata (TC=19): sovrascrive la stima da posizioni.
+            if message.speed_kt is not None:
+                track.speed_kt = max(0.0, message.speed_kt)
+                track.speed_source = "reported"
+            if message.vertical_rate_fpm is not None:
+                track.vertical_ft_min = message.vertical_rate_fpm
+                track.vertical_source = "reported"
+            if message.track_deg is not None:
+                track.track_deg = message.track_deg
+
             if (
                 message.cpr_format is not None
                 and message.cpr_lat is not None
@@ -649,7 +784,10 @@ class AirTrafficTracker:
                     track.even_cpr = cpr
                 else:
                     track.odd_cpr = cpr
-                self._try_update_position(track)
+                self._try_update_position(
+                    track,
+                    (message.cpr_lat, message.cpr_lon, message.cpr_format, message.timestamp),
+                )
 
             self._prune_locked(utc_now())
 
@@ -708,6 +846,7 @@ class AirTrafficTracker:
                         "rssi": track.rssi,
                         "speed_kt": track.speed_kt,
                         "vertical_ft_min": track.vertical_ft_min,
+                        "track_deg": track.track_deg,
                         "speed_source": track.speed_source,
                         "vertical_source": track.vertical_source,
                         "trail": [
@@ -728,27 +867,53 @@ class AirTrafficTracker:
     def _key(self, protocol: str, icao: str) -> str:
         return f"{protocol}:{icao}"
 
-    def _try_update_position(self, track: Track) -> None:
-        if track.even_cpr is None or track.odd_cpr is None:
+    def _try_update_position(self, track: Track, latest: tuple[int, int, int, float]) -> None:
+        # 1) CPR globale se ho una coppia even+odd recente (piu' robusto).
+        pos = self._global_cpr(track)
+        # 2) Fallback CPR locale con la posizione della stazione (fix immediato
+        #    da un singolo messaggio, prima di avere la coppia even/odd).
+        if pos is None:
+            pos = self._local_cpr(latest)
+        if pos is None:
             return
+        lat, lon, now = pos
+        if self._accept_position(track, lat, lon, now):
+            self._set_position(track, lat, lon, now)
+
+    def _global_cpr(self, track: Track) -> Optional[tuple[float, float, float]]:
+        if track.even_cpr is None or track.odd_cpr is None:
+            return None
         even_lat, even_lon, even_time = track.even_cpr
         odd_lat, odd_lon, odd_time = track.odd_cpr
         if abs(even_time - odd_time) > CPR_MAX_PAIR_AGE_S:
-            return
+            return None
         decoded = decode_global_cpr(even_lat, even_lon, even_time, odd_lat, odd_lon, odd_time)
         if decoded is None:
-            return
+            return None
         lat, lon = decoded
-        now = max(even_time, odd_time)
-        if track.lat is not None and track.lon is not None and track.last_position is not None:
-            if now + 0.5 < track.last_position:
-                return
-            distance_km = haversine_km(track.lat, track.lon, lat, lon)
-            elapsed_s = max(0.5, now - track.last_position)
-            max_distance_km = max(MIN_TRACK_JUMP_GATE_KM, elapsed_s * MAX_TRACK_SPEED_KM_S)
-            if distance_km > max_distance_km:
-                return
-        self._set_position(track, lat, lon, now)
+        return lat, lon, max(even_time, odd_time)
+
+    def _local_cpr(self, latest: tuple[int, int, int, float]) -> Optional[tuple[float, float, float]]:
+        if self.ref_lat is None or self.ref_lon is None:
+            return None
+        cpr_lat, cpr_lon, cpr_format, ts = latest
+        decoded = decode_local_cpr(cpr_lat, cpr_lon, cpr_format, self.ref_lat, self.ref_lon)
+        if decoded is None:
+            return None
+        lat, lon = decoded
+        if haversine_km(self.ref_lat, self.ref_lon, lat, lon) > LOCAL_CPR_MAX_RANGE_KM:
+            return None
+        return lat, lon, ts
+
+    def _accept_position(self, track: Track, lat: float, lon: float, now: float) -> bool:
+        if track.lat is None or track.lon is None or track.last_position is None:
+            return True
+        if now + 0.5 < track.last_position:
+            return False
+        distance_km = haversine_km(track.lat, track.lon, lat, lon)
+        elapsed_s = max(0.5, now - track.last_position)
+        max_distance_km = max(MIN_TRACK_JUMP_GATE_KM, elapsed_s * MAX_TRACK_SPEED_KM_S)
+        return distance_km <= max_distance_km
 
     def _snapshot_trail(self, track: Track, now: float) -> list[tuple[float, float, float, Optional[int]]]:
         self._trim_trail(track, now)
@@ -875,6 +1040,7 @@ class RuntimeStats:
         self.preambles_total = 0
         self.crc_ok = 0
         self.crc_bad = 0
+        self.crc_corrected = 0
         self.adsb_messages_total = 0
         self.flarm_messages_total = 0
         self.flarm_bursts_total = 0
@@ -975,6 +1141,7 @@ class RuntimeStats:
             self.preambles_total += batch.preambles
             self.crc_ok += batch.crc_ok
             self.crc_bad += batch.crc_bad
+            self.crc_corrected += batch.crc_corrected
             self.adsb_messages_total += len(batch.messages)
             self.messages_total += len(batch.messages)
             self.noise_floor = batch.noise_floor
@@ -1045,6 +1212,7 @@ class RuntimeStats:
                 "preambles_total": self.preambles_total,
                 "crc_ok": self.crc_ok,
                 "crc_bad": self.crc_bad,
+                "crc_corrected": self.crc_corrected,
                 "crc_ratio": crc_ratio,
                 "buffers_total": self.buffers_total,
                 "active_tracks": active_tracks,
@@ -2056,7 +2224,7 @@ def make_handler(
 
 def run_server(args: argparse.Namespace) -> int:
     stop_event = threading.Event()
-    tracker = AirTrafficTracker()
+    tracker = AirTrafficTracker(ref_lat=args.rx_lat, ref_lon=args.rx_lon)
     broker = SseBroker()
     visuals = SharedVisuals()
     stats = RuntimeStats(args.source, args)
@@ -2126,7 +2294,29 @@ def run_self_test() -> int:
     lat, lon = pos
     assert abs(lat - 52.2572) < 0.01
     assert abs(lon - 3.9193) < 0.01
-    print("Self-test ADS-B OK")
+
+    # Velocita' (TC=19): vettore standard, ground speed 159 kt / 182.88 deg / -832 fpm.
+    vel = parse_adsb_frame(bytes.fromhex("8D485020994409940838175B284F"))
+    assert vel is not None and vel.type_code == 19
+    assert vel.speed_kt is not None and abs(vel.speed_kt - 159.20) < 1.0
+    assert vel.track_deg is not None and abs(vel.track_deg - 182.88) < 1.0
+    assert vel.vertical_rate_fpm is not None and abs(vel.vertical_rate_fpm - (-832.0)) < 1.0
+
+    # CPR locale: lo stesso messaggio "even", con riferimento vicino, ritorna la
+    # posizione nota ricavata via CPR globale.
+    loc = decode_local_cpr(even.cpr_lat or 0, even.cpr_lon or 0, even.cpr_format or 0, 52.0, 4.0)
+    assert loc is not None
+    assert abs(loc[0] - 52.2572) < 0.05 and abs(loc[1] - 3.9193) < 0.05
+
+    # Correzione CRC a 1 bit: invertendo un bit, la sindrome lo identifica e lo ripristina.
+    corrupt = bytearray(callsign_msg)
+    corrupt[5] ^= 0x08
+    syndrome = mode_s_crc(bytes(corrupt), 112)
+    assert syndrome != 0
+    fixed = correct_single_bit(bytes(corrupt), syndrome)
+    assert fixed == callsign_msg
+
+    print("Self-test ADS-B OK (velocita' TC19 + CPR locale + correzione CRC)")
     flarm_legacy.self_test()
     return 0
 
