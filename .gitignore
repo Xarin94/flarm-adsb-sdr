@@ -10,3 +10,7 @@ yarn-error.log*
 *.log
 __pycache__/
 *.pyc
+# log runtime del ricevitore avviato in background
+rx_out.txt
+rx_err.txt
+rx_pid.txt

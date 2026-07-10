@@ -38,6 +38,10 @@ ADS_B_FREQ_HZ = 1_090_000_000
 FLARM_EU_FREQ_HZ = 868_200_000
 DEFAULT_SAMPLE_RATE = 4_000_000
 DEFAULT_RF_BW = 2_800_000
+# Banda RF su 868 MHz: FLARM/ADS-L occupano ~250 kHz (2-FSK 100 kchip/s,
+# +/-50 kHz); 300 kHz e' il minimo utile per far entrare i burst tenendo fuori
+# il rumore della banda SRD. Il sample rate resta 4 MS/s (serve per l'ADS-B).
+DEFAULT_FLARM_RF_BW = 300_000
 DEFAULT_GAIN_DB = 35.0
 DEFAULT_MIN_GAIN_DB = 5.0
 DEFAULT_MAX_GAIN_DB = 52.0
@@ -655,7 +659,7 @@ class FlarmBatch:
 
 
 class FLARMDecoder:
-    """Decoder del protocollo radio FLARM Legacy (v6/v7).
+    """Decoder dei protocolli radio su 868 MHz: FLARM Legacy (v6/v7) e ADS-L.
 
     Esegue demodulazione 2-FSK/GFSK + Manchester + sync + CRC sui campioni I/Q
     (vedi flarm_legacy), poi decifra e interpreta i pacchetti. Mantiene anche un
@@ -676,12 +680,17 @@ class FLARMDecoder:
 
         now = utc_now()
         demod = self.receiver.process(samples.astype(np.complex64, copy=False))
+        decoded: list[Optional[flarm_legacy.FlarmTarget]] = [
+            flarm_legacy.decode_payload(payload, self.ref_lat, self.ref_lon, now)
+            for payload in demod.payloads
+        ]
+        # ADS-L: stesso PHY su 868 MHz, decodificato insieme al FLARM legacy.
+        decoded.extend(flarm_legacy.decode_adsl(frame) for frame in demod.adsl_frames)
         targets: list[flarm_legacy.FlarmTarget] = []
-        for payload in demod.payloads:
-            target = flarm_legacy.decode_payload(payload, self.ref_lat, self.ref_lon, now)
+        for target in decoded:
             if target is None:
                 continue
-            dedup_key = f"{target.version}:{target.addr_hex}"
+            dedup_key = f"{target.proto}:{target.version}:{target.addr_hex}"
             if self.recent.get(dedup_key, 0.0) > now - 0.8:
                 continue
             self.recent[dedup_key] = now
@@ -1030,6 +1039,8 @@ class RuntimeStats:
         self.enabled_protocols = normalize_protocols(getattr(args, "protocols", None))
         self.sample_rate = args.sample_rate
         self.rf_bandwidth = args.rf_bandwidth
+        self.adsb_rf_bandwidth = args.rf_bandwidth
+        self.flarm_rf_bandwidth = getattr(args, "flarm_rf_bandwidth", DEFAULT_FLARM_RF_BW)
         self.gain_mode = args.gain_mode
         self.gain_db: Optional[float] = args.gain
         self.rx1_active = False
@@ -1080,6 +1091,7 @@ class RuntimeStats:
             self.rx_data_channels = []
             self.active_frequency = self.center_frequency
             self.active_protocol = PROTOCOL_ADSB
+            self.rf_bandwidth = self.adsb_rf_bandwidth
             self.rx0_scan = False
             self.message_times.clear()
 
@@ -1119,10 +1131,14 @@ class RuntimeStats:
         with self.lock:
             self.rx0_scan = enabled
 
-    def set_active_tuning(self, protocol: str, frequency: int) -> None:
+    def set_active_tuning(self, protocol: str, frequency: int,
+                          rf_bandwidth: Optional[int] = None) -> None:
         with self.lock:
             self.active_protocol = protocol
             self.active_frequency = int(frequency)
+            if rf_bandwidth is not None:
+                # La UI mostra la banda del canale attivo (per-protocollo).
+                self.rf_bandwidth = int(rf_bandwidth)
 
     def set_enabled_protocols(self, protocols: list[str]) -> list[str]:
         with self.lock:
@@ -1200,6 +1216,8 @@ class RuntimeStats:
                 "rx0_scan": self.rx0_scan,
                 "sample_rate": self.sample_rate,
                 "rf_bandwidth": self.rf_bandwidth,
+                "adsb_rf_bandwidth": self.adsb_rf_bandwidth,
+                "flarm_rf_bandwidth": self.flarm_rf_bandwidth,
                 "gain_mode": self.gain_mode,
                 "gain_db": self.gain_db,
                 "rx1_active": self.rx1_active,
@@ -1373,7 +1391,8 @@ class PlutoSource:
         self.sdr.sample_rate = int(args.sample_rate)
         self.current_frequency = int(args.center_frequency)
         self.sdr.rx_lo = self.current_frequency
-        self.sdr.rx_rf_bandwidth = int(args.rf_bandwidth)
+        self.current_bandwidth = int(args.rf_bandwidth)
+        self.sdr.rx_rf_bandwidth = self.current_bandwidth
         self.sdr.rx_buffer_size = int(args.buffer_size)
 
         iio_gain_mode = "manual" if args.gain_mode in ("manual", "manual-fixed") else args.gain_mode
@@ -1485,17 +1504,27 @@ class PlutoSource:
         is_complex = bool(getattr(self.sdr, "_complex_data", False))
         self.rx_complex_streams = len(channels) // 2 if is_complex else len(channels)
 
-    def set_frequency(self, frequency_hz: int, settle_ms: float = 0.0) -> None:
+    def set_frequency(self, frequency_hz: int, settle_ms: float = 0.0,
+                      rf_bandwidth_hz: Optional[int] = None) -> None:
         frequency = int(frequency_hz)
-        if frequency == self.current_frequency:
+        bandwidth = int(rf_bandwidth_hz) if rf_bandwidth_hz else None
+        retune = frequency != self.current_frequency
+        rebandwidth = bandwidth is not None and bandwidth != self.current_bandwidth
+        if not retune and not rebandwidth:
             return
         try:
             self.sdr.rx_destroy_buffer()
         except Exception:
             pass
-        self.sdr.rx_lo = frequency
-        self.current_frequency = frequency
-        if settle_ms > 0:
+        if retune:
+            self.sdr.rx_lo = frequency
+            self.current_frequency = frequency
+        if rebandwidth and bandwidth is not None:
+            # Filtro analogico stretto sul canale attivo (es. 300 kHz su 868 MHz):
+            # meno rumore fuori canale a parita' di sample rate.
+            self.sdr.rx_rf_bandwidth = bandwidth
+            self.current_bandwidth = bandwidth
+        if settle_ms > 0 and retune:
             time.sleep(settle_ms / 1000.0)
 
     def read_channels(self) -> tuple[np.ndarray, Optional[np.ndarray]]:
@@ -1601,6 +1630,10 @@ class PlutoReceiver(threading.Thread):
             PROTOCOL_ADSB: int(args.center_frequency),
             PROTOCOL_FLARM: int(args.flarm_frequency),
         }
+        self.bw_map = {
+            PROTOCOL_ADSB: int(args.rf_bandwidth),
+            PROTOCOL_FLARM: int(args.flarm_rf_bandwidth),
+        }
         self.scan_index = 0
         self.next_scan_switch = 0.0
         self.gain_control = (
@@ -1662,12 +1695,13 @@ class PlutoReceiver(threading.Thread):
         for target in flarm_batch.targets:
             if target.no_track:
                 continue
+            label = "AL" if target.proto == "adsl" else "FL"
             self.tracker.upsert_position(
                 target.addr_hex,
                 target.latitude,
                 target.longitude,
                 target.altitude_m * 3.2808399,
-                f"FL{target.addr_hex}",
+                f"{label}{target.addr_hex}",
                 now,
                 protocol=PROTOCOL_FLARM,
                 speed_kt=target.speed_kt,
@@ -1702,8 +1736,9 @@ class PlutoReceiver(threading.Thread):
         try:
             while not self.stop_event.is_set():
                 protocol, frequency = self._current_scan_band()
-                self.source.set_frequency(frequency, float(self.args.tune_settle_ms))
-                self.stats.set_active_tuning(protocol, frequency)
+                bandwidth = self.bw_map[protocol]
+                self.source.set_frequency(frequency, float(self.args.tune_settle_ms), bandwidth)
+                self.stats.set_active_tuning(protocol, frequency, bandwidth)
                 samples, flarm_samples = self.source.read_channels()
 
                 if self.rx0_scan_enabled:
@@ -2260,7 +2295,8 @@ def run_server(args: argparse.Namespace) -> int:
     print(f"Pluto ADS-B Tracker: http://{actual_host}:{actual_port}")
     print(
         f"Sorgente attiva: {stats.snapshot(0)['source']}  "
-        f"sample_rate={args.sample_rate} rf_bw={args.rf_bandwidth} ui_rate={ui_rate_hz:.1f}Hz"
+        f"sample_rate={args.sample_rate} rf_bw={args.rf_bandwidth} "
+        f"flarm_rf_bw={args.flarm_rf_bandwidth} ui_rate={ui_rate_hz:.1f}Hz"
     )
 
     try:
@@ -2339,7 +2375,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--center-frequency", type=int, default=ADS_B_FREQ_HZ)
     parser.add_argument("--flarm-frequency", type=int, default=FLARM_EU_FREQ_HZ)
     parser.add_argument("--sample-rate", type=int, default=DEFAULT_SAMPLE_RATE)
-    parser.add_argument("--rf-bandwidth", type=int, default=DEFAULT_RF_BW)
+    parser.add_argument("--rf-bandwidth", type=int, default=DEFAULT_RF_BW, help="Banda RF sul canale ADS-B 1090 MHz")
+    parser.add_argument("--flarm-rf-bandwidth", type=int, default=DEFAULT_FLARM_RF_BW, help="Banda RF sul canale FLARM/ADS-L 868 MHz: minimo utile ~300 kHz")
     parser.add_argument("--buffer-size", type=int, default=262144)
     parser.add_argument("--ui-rate-hz", type=float, default=DEFAULT_UI_RATE_HZ, help="Frequenza refresh UI HTTP/SSE, 1-30 Hz")
     parser.add_argument("--dual-rx", action=argparse.BooleanOptionalAction, default=False, help="Abilita RX0+RX1 solo se il buffer IIO espone due stream complessi reali")
@@ -2359,11 +2396,29 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def sanitize_rf_args(args: argparse.Namespace) -> None:
+    """Vincola le bande RF al sample rate (Nyquist): una banda analogica piu'
+    larga del rate di campionamento fa solo entrare alias e rumore. Il minimo
+    del filtro AD936x e' ~200 kHz."""
+    sample_rate = int(args.sample_rate)
+    for name in ("rf_bandwidth", "flarm_rf_bandwidth"):
+        bandwidth = int(getattr(args, name))
+        clamped = max(200_000, min(bandwidth, sample_rate))
+        if clamped != bandwidth:
+            print(
+                f"Attenzione: --{name.replace('_', '-')}={bandwidth} fuori range, "
+                f"uso {clamped} (sample rate {sample_rate})",
+                file=sys.stderr,
+            )
+            setattr(args, name, clamped)
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     parser = build_arg_parser()
     args = parser.parse_args(argv)
     if args.self_test:
         return run_self_test()
+    sanitize_rf_args(args)
     return run_server(args)
 
 

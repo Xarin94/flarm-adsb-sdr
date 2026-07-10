@@ -116,6 +116,8 @@ La scelta corretta e usare `4 MS/s` per avere due campioni per ogni mezzo bit AD
 
 Il progetto deve quindi esporre `--sample-rate` e `--rf-bandwidth`, usando come default `4.0 MS/s` e `2.8 MHz`.
 
+Sul canale `868 MHz` vale il ragionamento opposto: FLARM e ADS-L sono 2-FSK a `100 kchip/s` con deviazione `+/-50 kHz`, quindi il segnale occupa ~`250 kHz`. La banda RF va tenuta al minimo utile (`--flarm-rf-bandwidth`, default `300 kHz`) per far entrare i burst tagliando il rumore della banda SRD-860, mentre il sample rate resta `4 MS/s` (abbassarlo peggiorerebbe l'ADS-B; la banda viene comunque limitata a Nyquist). Il cambio di filtro avviene automaticamente a ogni retune dello scan RX0. Sullo stesso canale il decoder demodula anche i beacon ADS-L (EASA SRD-860, iConspicuity): stesso PHY del FLARM Legacy, syncword `Manchester(0xF5724B18)`, scrambling XXTEA a chiave zero e CRC-24 Mode-S.
+
 Il PlutoSDR disponibile ha TCXO da `0.1 ppm`. A `1090 MHz` questo corrisponde a circa `109 Hz` di errore nominale, quindi il drift di frequenza e trascurabile rispetto a una bandwidth RF nell'ordine di `2.8-3.2 MHz`. Il margine di banda serve soprattutto a preservare i fronti e la forma dei pulse ADS-B, non a compensare il drift dell'oscillatore.
 
 #### Gain adattivo

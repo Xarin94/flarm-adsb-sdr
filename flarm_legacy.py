@@ -45,6 +45,19 @@ LEGACY_SYNCWORD = bytes((0x55, 0x99, 0xA5, 0xA9, 0x55, 0x66, 0x65, 0x96))
 LEGACY_PAYLOAD_SIZE = 24
 LEGACY_CRC_SIZE = 2
 
+# --- ADS-L (EASA SRD-860): stesso PHY del Legacy (2-FSK 100 kchip/s, +/-50 kHz,
+# Manchester, payload invertito), cambia solo il framing. Costanti da SoftRF
+# (ADSL.h/ADSL.cpp) e dalla classe ADSL_Packet di pjalocha (adsl.h):
+#   syncword on-air = Manchester(0xF5 0x72 'r' 0x4B 'K' 0x18=Length)
+#   frame dopo il sync = Version(1) + 5 word scrambled XXTEA-key0 (20) + CRC24(3)
+#   CRC-24 Mode-S (poly 0xFFF409) calcolato sui 21 byte Version+payload
+ADSL_SYNCWORD = bytes((0x55, 0x99, 0x95, 0xA6, 0x9A, 0x65, 0xA9, 0x6A))
+ADSL_FRAME_SIZE = 24
+ADSL_CRC_SIZE = 3
+ADSL_CRC24_POLY = 0xFFF409
+# Conversione coordinate FANET-cordic -> gradi (da ADSL_Packet::FNTtoFloat).
+FNT_COORD_DEG = 90.0007295677 / float(1 << 30)
+
 CHIP_RATE_HZ = 100_000
 FSK_DEVIATION_HZ = 50_000
 
@@ -151,6 +164,61 @@ def crc_ccitt(data: bytes, crc: int = 0xFFFF) -> int:
     return crc & 0xFFFF
 
 
+# --- CRC-24 Mode-S (init 0, poly 0xFFF409), usato da ADS-L -------------------
+
+def crc_adsl(data: bytes) -> int:
+    crc = 0
+    for byte in data:
+        crc ^= byte << 16
+        for _ in range(8):
+            crc = ((crc << 1) ^ ADSL_CRC24_POLY) & 0xFFFFFF if (crc & 0x800000) else (crc << 1) & 0xFFFFFF
+    return crc
+
+
+# --- Codifica a risoluzione variabile ADS-L (da ognconv.h di pjalocha) --------
+
+def _uns_vr_decode(value: int, bits: int) -> int:
+    thres = 1 << bits
+    rng = value >> bits
+    value &= thres - 1
+    if rng == 0:
+        return value
+    if rng == 1:
+        return thres + 1 + (value << 1)
+    if rng == 2:
+        return 3 * thres + 2 + (value << 2)
+    return 7 * thres + 4 + (value << 3)
+
+
+def _uns_vr_encode(value: int, bits: int) -> int:
+    thres = 1 << bits
+    if value < thres:
+        return value
+    if value < 3 * thres:
+        return thres | ((value - thres) >> 1)
+    if value < 7 * thres:
+        return 2 * thres | ((value - 3 * thres) >> 2)
+    if value < 15 * thres:
+        return 3 * thres | ((value - 7 * thres) >> 3)
+    return 4 * thres - 1
+
+
+def _sign_vr_decode(value: int, bits: int) -> int:
+    sign_mask = 1 << (bits + 2)
+    sign = value & sign_mask
+    out = _uns_vr_decode(value & (sign_mask - 1), bits)
+    return -out if sign else out
+
+
+def _sign_vr_encode(value: int, bits: int) -> int:
+    sign_mask = 1 << (bits + 2)
+    sign = 0
+    if value < 0:
+        value = -value
+        sign = sign_mask
+    return _uns_vr_encode(value, bits) | sign
+
+
 # --- enscale/descale (verbatim da Legacy.cpp) --------------------------------
 
 def descale(value: int, mbits: int, ebits: int) -> int:
@@ -250,6 +318,7 @@ class FlarmTarget:
     stealth: bool
     no_track: bool
     version: int
+    proto: str = "flarm"  # "flarm" (Legacy v6/v7) oppure "adsl"
 
     @property
     def addr_hex(self) -> str:
@@ -431,18 +500,91 @@ def _decode_v7(raw: bytes, ref_lat: float, ref_lon: float, timestamp: int) -> Op
     )
 
 
+# --- Decodifica pacchetto ADS-L iConspicuity ----------------------------------
+
+# AcftCat ADS-L -> aircraft type OGN/FLARM (da ADSL_Packet::getAcftTypeOGN).
+_ADSL_ACFT_MAP = (0, 8, 9, 3, 1, 12, 2, 7, 4, 13, 3, 13, 13, 13, 0, 0,
+                  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+
+
+def _adsl_addr_type(addr_table: int) -> int:
+    # Tabelle indirizzi ADS-L -> addr_type OGN: 5=ICAO, 6=FLARM, 7=OGN, 8=FANET.
+    if addr_table == 0x05:
+        return 1
+    if addr_table in (0x06, 0x08):
+        return 2
+    if addr_table == 0x07:
+        return 3
+    return 0
+
+
+def decode_adsl(frame: bytes) -> Optional[FlarmTarget]:
+    """Decodifica un frame ADS-L di 24 byte (Version + payload + CRC24), gia'
+    de-invertito. Le coordinate sono assolute (FANET cordic): non servono
+    posizione di riferimento ne' timestamp."""
+    if len(frame) < ADSL_FRAME_SIZE:
+        return None
+    frame = bytes(frame[:ADSL_FRAME_SIZE])
+    # checkPI: il CRC-24 ricalcolato su Version+payload+CRC deve azzerarsi.
+    if crc_adsl(frame) != 0:
+        return None
+    words = _words_from_bytes(frame[1:21])
+    btea(words, -5, (0, 0, 0, 0))  # XXTEA_Decrypt_Key0: scrambling a chiave zero
+    data = _bytes_from_words(words)
+
+    if (data[0] & 0x7F) != 0x02:  # solo iConspicuity (bit7 = unicast)
+        return None
+    addr_word = int.from_bytes(data[1:5], "little")
+    addr = (addr_word >> 6) & 0xFFFFFF
+    addr_table = data[1] & 0x3F
+    acft_cat = data[6] & 0x1F
+    pos = data[7:18]
+
+    lat_fnt = int.from_bytes(pos[0:3], "little") << 8
+    if lat_fnt & 0x80000000:
+        lat_fnt -= 1 << 32
+    lat_fnt >>= 1
+    lon_fnt = int.from_bytes(pos[3:6], "little") << 8
+    if lon_fnt & 0x80000000:
+        lon_fnt -= 1 << 32
+
+    speed_mps = _uns_vr_decode(pos[6], 6) * 0.25
+    alt_word = ((pos[8] & 0x3F) << 8) | pos[7]
+    alt_m = _uns_vr_decode(alt_word, 12) - 316
+    climb_word = ((pos[9] & 0x7F) << 2) | (pos[8] >> 6)
+    vs_mps = 0.0 if climb_word == 0x100 else _sign_vr_decode(climb_word, 6) * 0.125
+    track_word = (pos[10] << 1) | (pos[9] >> 7)
+
+    return FlarmTarget(
+        addr=addr,
+        addr_type=_adsl_addr_type(addr_table),
+        aircraft_type=_ADSL_ACFT_MAP[acft_cat],
+        latitude=lat_fnt * FNT_COORD_DEG,
+        longitude=lon_fnt * FNT_COORD_DEG,
+        altitude_m=float(alt_m),
+        speed_kt=speed_mps / MPS_PER_KNOT,
+        course_deg=track_word * (45.0 / 64.0),
+        vs_ft_min=vs_mps * FEET_PER_METER * 60.0,
+        stealth=False,
+        no_track=False,
+        version=frame[0] & 0x0F,  # Version[4]/Signature[1]/Key[2]/Reserved[1], LSB-first
+        proto="adsl",
+    )
+
+
 # --- Front-end DSP: demodulazione 2-FSK + Manchester + sync + CRC ------------
 
-def _sync_chip_bits() -> np.ndarray:
+def _sync_chip_bits(syncword: bytes = LEGACY_SYNCWORD) -> np.ndarray:
     """Bit (chip) del syncword, MSB-first, come +/-1."""
     bits = []
-    for byte in LEGACY_SYNCWORD:
+    for byte in syncword:
         for k in range(7, -1, -1):
             bits.append(1 if (byte >> k) & 1 else -1)
     return np.array(bits, dtype=np.float32)
 
 
 _SYNC_CHIPS = _sync_chip_bits()
+_ADSL_SYNC_CHIPS = _sync_chip_bits(ADSL_SYNCWORD)
 
 
 def _manchester_decode_bits(chips: np.ndarray) -> Optional[list[int]]:
@@ -474,6 +616,7 @@ def _bytes_from_msb_bits(bits: list[int]) -> bytes:
 @dataclass
 class FlarmDemodResult:
     payloads: list[bytes] = field(default_factory=list)
+    adsl_frames: list[bytes] = field(default_factory=list)
     crc_ok: int = 0
     crc_bad: int = 0
     sync_hits: int = 0
@@ -483,11 +626,18 @@ class FlarmLegacyReceiver:
     def __init__(self, sample_rate: int) -> None:
         self.sample_rate = int(sample_rate)
         self.sps = max(2, int(round(self.sample_rate / CHIP_RATE_HZ)))
-        # Template del sync upsampled (per la cross-correlazione sul discriminatore).
-        self.sync_template = np.repeat(_SYNC_CHIPS, self.sps).astype(np.float32)
-        self.sync_template -= self.sync_template.mean()
+        # Template dei sync upsampled (per la cross-correlazione sul discriminatore).
+        def _template(chips: np.ndarray) -> np.ndarray:
+            tmpl = np.repeat(chips, self.sps).astype(np.float32)
+            tmpl -= tmpl.mean()
+            return tmpl
+
+        self.sync_template = _template(_SYNC_CHIPS)
+        self.adsl_sync_template = _template(_ADSL_SYNC_CHIPS)
         # chip totali per pacchetto: (payload+crc) byte * 8 bit * 2 chip Manchester
         self.frame_chips = (LEGACY_PAYLOAD_SIZE + LEGACY_CRC_SIZE) * 8 * 2
+        self.adsl_frame_chips = ADSL_FRAME_SIZE * 8 * 2
+        self.max_frame_chips = max(self.frame_chips, self.adsl_frame_chips)
 
     def _discriminator(self, iq: np.ndarray) -> np.ndarray:
         x = np.asarray(iq, dtype=np.complex64)
@@ -496,15 +646,14 @@ class FlarmLegacyReceiver:
         d = np.angle(x[1:] * np.conj(x[:-1])).astype(np.float32)
         return d
 
-    def _find_sync(self, disc: np.ndarray) -> list[tuple[int, float]]:
+    def _find_sync(self, disc: np.ndarray, tmpl: np.ndarray, frame_chips: int) -> list[tuple[int, float]]:
         """Ritorna [(indice_inizio_chip, polarita)] per ogni picco di correlazione.
 
         Cross-correlazione lineare via FFT: corr[lag] = somma_n disc[lag+n]*tmpl[n],
         quindi il picco a `lag` e' l'indice di inizio del syncword nel discriminatore.
         """
-        tmpl = self.sync_template
         sync_len = tmpl.size
-        frame_len = self.frame_chips * self.sps
+        frame_len = frame_chips * self.sps
         valid = disc.size - sync_len - frame_len
         if valid <= 0:
             return []
@@ -571,20 +720,25 @@ class FlarmLegacyReceiver:
         min_active = (8 * 8 * 2) * self.sps  # almeno ~8 byte di frame attivo
         return [(int(s), int(e)) for s, e in zip(starts, ends) if (e - s) >= min_active]
 
+    def _demod_frame(self, disc: np.ndarray, sync_end: int, frame_chips: int, polarity: float) -> Optional[bytearray]:
+        """Chip -> Manchester -> byte de-invertiti (payload invertito on-air)."""
+        chips = self._slice_chips(disc, sync_end, frame_chips, polarity)
+        if chips is None:
+            return None
+        bits = _manchester_decode_bits(chips)
+        if bits is None:
+            return None
+        data = bytearray(_bytes_from_msb_bits(bits))
+        for i in range(len(data)):
+            data[i] ^= 0xFF
+        return data
+
     def _try_decode(self, disc: np.ndarray, result: FlarmDemodResult) -> None:
-        for sync_end, polarity in self._find_sync(disc):
+        # FLARM Legacy v6/v7
+        for sync_end, polarity in self._find_sync(disc, self.sync_template, self.frame_chips):
             result.sync_hits += 1
-            chips = self._slice_chips(disc, sync_end, self.frame_chips, polarity)
-            if chips is None:
-                continue
-            bits = _manchester_decode_bits(chips)
-            if bits is None:
-                continue
-            data = bytearray(_bytes_from_msb_bits(bits))
-            # Payload invertito on-air: de-inverti payload + CRC.
-            for i in range(len(data)):
-                data[i] ^= 0xFF
-            if len(data) < LEGACY_PAYLOAD_SIZE + LEGACY_CRC_SIZE:
+            data = self._demod_frame(disc, sync_end, self.frame_chips, polarity)
+            if data is None or len(data) < LEGACY_PAYLOAD_SIZE + LEGACY_CRC_SIZE:
                 continue
             payload = bytes(data[:LEGACY_PAYLOAD_SIZE])
             crc_rx = (data[LEGACY_PAYLOAD_SIZE] << 8) | data[LEGACY_PAYLOAD_SIZE + 1]
@@ -593,11 +747,31 @@ class FlarmLegacyReceiver:
                 result.payloads.append(payload)
             else:
                 result.crc_bad += 1
+        # ADS-L SRD-860 (stesso PHY, syncword e CRC diversi)
+        for sync_end, polarity in self._find_sync(disc, self.adsl_sync_template, self.adsl_frame_chips):
+            result.sync_hits += 1
+            data = self._demod_frame(disc, sync_end, self.adsl_frame_chips, polarity)
+            if data is None or len(data) < ADSL_FRAME_SIZE:
+                continue
+            # In aria esistono entrambe le polarita' del payload: SoftRF marca
+            # ADS-L come RF_PAYLOAD_INVERTED (frame trasmesso invertito, come
+            # il Legacy), mentre altri tracker (es. RAK4631/SX1262 con encode
+            # Manchester IEEE diretto) trasmettono i byte non invertiti. Il
+            # sync on-air e' identico nei due casi; il CRC-24 seleziona la
+            # polarita' corretta.
+            frame = bytes(data[:ADSL_FRAME_SIZE])
+            if crc_adsl(frame) != 0:
+                frame = bytes(b ^ 0xFF for b in frame)
+            if crc_adsl(frame) == 0:
+                result.crc_ok += 1
+                result.adsl_frames.append(frame)
+            else:
+                result.crc_bad += 1
 
     def process(self, iq: np.ndarray) -> FlarmDemodResult:
         result = FlarmDemodResult()
         x = np.asarray(iq, dtype=np.complex64)
-        frame_len = self.frame_chips * self.sps
+        frame_len = self.max_frame_chips * self.sps
         if x.size < self.sync_template.size + frame_len + 2 * self.sps:
             return result
         mag = np.abs(x).astype(np.float32, copy=False)
@@ -614,19 +788,25 @@ class FlarmLegacyReceiver:
 
 # --- Encoder/modulatore (solo per self-test, NON usato in ricezione) ---------
 
-def _chips_from_payload(payload: bytes) -> np.ndarray:
-    crc = crc_ccitt(payload)
-    framed = bytearray(payload) + bytes((crc >> 8, crc & 0xFF))
-    for i in range(len(framed)):
-        framed[i] ^= 0xFF  # payload invertito
+def _chips_from_frame(frame: bytes, sync_chips_pm: np.ndarray, invert: bool = True) -> np.ndarray:
+    """Preambolo + syncword on-air + Manchester(frame), come chip 0/1.
+
+    Con invert=True il frame viene invertito prima del Manchester (convenzione
+    SoftRF RF_PAYLOAD_INVERTED); con False i byte vanno in aria diretti."""
+    body = bytes(b ^ 0xFF for b in frame) if invert else bytes(frame)
     chips = []
-    for byte in framed:
+    for byte in body:
         for k in range(7, -1, -1):
             bit = (byte >> k) & 1
             chips.extend((0, 1) if bit else (1, 0))  # Manchester IEEE 1->01
-    sync_chips = [1 if c > 0 else 0 for c in _SYNC_CHIPS]
+    sync_chips = [1 if c > 0 else 0 for c in sync_chips_pm]
     preamble = [0, 1] * 8
     return np.array(preamble + sync_chips + chips, dtype=np.int8)
+
+
+def _chips_from_payload(payload: bytes) -> np.ndarray:
+    crc = crc_ccitt(payload)
+    return _chips_from_frame(bytes(payload) + bytes((crc >> 8, crc & 0xFF)), _SYNC_CHIPS)
 
 
 def modulate(payload: bytes, sample_rate: int, noise_amp: float = 0.0,
@@ -643,6 +823,58 @@ def modulate(payload: bytes, sample_rate: int, noise_amp: float = 0.0,
         rng = np.random.default_rng(12345)
         out += (noise_amp * (rng.standard_normal(out.size) + 1j * rng.standard_normal(out.size))).astype(np.complex64)
     return out
+
+
+def modulate_adsl(frame: bytes, sample_rate: int, noise_amp: float = 0.0,
+                  pad: int = 256, invert: bool = True) -> np.ndarray:
+    """Modula un frame ADS-L completo di CRC (per self-test)."""
+    sps = max(2, int(round(sample_rate / CHIP_RATE_HZ)))
+    chips = _chips_from_frame(frame, _ADSL_SYNC_CHIPS, invert=invert)
+    symbols = np.where(np.repeat(chips, sps) > 0, 1.0, -1.0).astype(np.float64)
+    dphi = 2.0 * np.pi * FSK_DEVIATION_HZ / sample_rate
+    phase = np.cumsum(symbols * dphi)
+    sig = np.exp(1j * phase).astype(np.complex64)
+    out = np.zeros(sig.size + 2 * pad, dtype=np.complex64)
+    out[pad:pad + sig.size] = sig
+    if noise_amp > 0:
+        rng = np.random.default_rng(54321)
+        out += (noise_amp * (rng.standard_normal(out.size) + 1j * rng.standard_normal(out.size))).astype(np.complex64)
+    return out
+
+
+def encode_adsl_frame(addr: int, lat: float, lon: float, alt_m: int,
+                      speed_kt: float, course_deg: float, vs_ft_min: float,
+                      acft_cat: int = 4, addr_table: int = 0x06) -> bytes:
+    """Costruisce un frame ADS-L iConspicuity (mirror di ADSL_Packet, solo test)."""
+    data = bytearray(20)
+    data[0] = 0x02  # iConspicuity
+    addr_word = ((addr & 0xFFFFFF) << 6) | (addr_table & 0x3F)
+    data[1:5] = addr_word.to_bytes(4, "little")
+    data[5] = 0x80  # TimeStamp=0, FlightState=2 (airborne)
+    data[6] = acft_cat & 0x1F
+
+    pos = bytearray(11)
+    lat_fnt = int(round(lat / FNT_COORD_DEG))
+    lon_fnt = int(round(lon / FNT_COORD_DEG))
+    pos[0:3] = (((lat_fnt + 0x40) >> 7) & 0xFFFFFF).to_bytes(3, "little")
+    pos[3:6] = (((lon_fnt + 0x80) >> 8) & 0xFFFFFF).to_bytes(3, "little")
+    pos[6] = _uns_vr_encode(int(round(speed_kt * MPS_PER_KNOT * 4.0)), 6)
+    alt_word = _uns_vr_encode(max(0, int(alt_m) + 316), 12)
+    pos[7] = alt_word & 0xFF
+    pos[8] = (alt_word >> 8) & 0x3F
+    climb_word = _sign_vr_encode(int(round(vs_ft_min / (FEET_PER_METER * 60.0) * 8.0)), 6)
+    pos[8] |= (climb_word & 0x03) << 6
+    pos[9] = (climb_word >> 2) & 0x7F
+    track_word = int(round((course_deg % 360.0) / (45.0 / 64.0))) & 0x1FF
+    pos[9] |= (track_word & 0x01) << 7
+    pos[10] = track_word >> 1
+    data[7:18] = pos
+
+    words = _words_from_bytes(bytes(data))
+    btea(words, 5, (0, 0, 0, 0))  # XXTEA_Encrypt_Key0
+    frame = bytes((0x00,)) + _bytes_from_words(words)  # Version=0
+    crc = crc_adsl(frame)
+    return frame + crc.to_bytes(3, "big")
 
 
 def encode_v6_payload(addr: int, lat: float, lon: float, alt_m: int,
@@ -776,9 +1008,42 @@ def self_test() -> None:
     assert t7 is not None and t7.version == 7, "decode v7 fallito"
     assert (t7.addr & 0xFFFFFF) == addr7, f"v7 addr {t7.addr_hex} != {addr7:06X}"
 
+    # 6) ADS-L end-to-end: frame -> scramble+CRC24 -> modula IQ -> demodula -> parse
+    addr_l = 0x2ABCDE
+    frame = encode_adsl_frame(
+        addr=addr_l, lat=45.901234, lon=9.201234, alt_m=1250,
+        speed_kt=62.0, course_deg=135.0, vs_ft_min=240.0, acft_cat=4,
+    )
+    assert len(frame) == ADSL_FRAME_SIZE and crc_adsl(frame) == 0, "CRC24 ADS-L incoerente"
+    burst_l = modulate_adsl(frame, sample_rate, noise_amp=0.05)
+    iq_l = (0.03 * (rng.standard_normal(200000) + 1j * rng.standard_normal(200000))).astype(np.complex64)
+    iq_l[80000:80000 + burst_l.size] += burst_l
+    res_l = rx.process(iq_l)
+    assert res_l.adsl_frames, f"nessun frame ADS-L demodulato (sync_hits={res_l.sync_hits}, crc_bad={res_l.crc_bad})"
+    tl = decode_adsl(res_l.adsl_frames[0])
+    assert tl is not None and tl.proto == "adsl", "decode ADS-L fallito"
+    assert (tl.addr & 0xFFFFFF) == addr_l, f"ADS-L addr {tl.addr_hex} != {addr_l:06X}"
+    assert abs(tl.latitude - 45.901234) < 0.0001, f"ADS-L lat {tl.latitude}"
+    assert abs(tl.longitude - 9.201234) < 0.0001, f"ADS-L lon {tl.longitude}"
+    assert abs(tl.altitude_m - 1250) <= 8, f"ADS-L alt {tl.altitude_m}"
+    assert abs(tl.speed_kt - 62.0) < 4.0, f"ADS-L spd {tl.speed_kt}"
+    assert abs(tl.course_deg - 135.0) < 1.0, f"ADS-L crs {tl.course_deg}"
+    assert tl.addr_type == 2 and tl.aircraft_type == 1, "ADS-L addr/acft type"
+
+    # 6b) ADS-L a polarita' diretta (frame non invertito, come i tracker
+    # SX1262 con Manchester IEEE senza inversione): stesso decode.
+    burst_ni = modulate_adsl(frame, sample_rate, noise_amp=0.05, invert=False)
+    iq_ni = (0.03 * (rng.standard_normal(200000) + 1j * rng.standard_normal(200000))).astype(np.complex64)
+    iq_ni[70000:70000 + burst_ni.size] += burst_ni
+    res_ni = rx.process(iq_ni)
+    assert res_ni.adsl_frames, "frame ADS-L non invertito non demodulato"
+    tni = decode_adsl(res_ni.adsl_frames[0])
+    assert tni is not None and (tni.addr & 0xFFFFFF) == addr_l, "decode ADS-L non invertito fallito"
+
     print("Self-test FLARM legacy OK "
           f"(v6 addr={target.addr_hex} lat={target.latitude:.5f} lon={target.longitude:.5f} "
-          f"alt={target.altitude_m:.0f}m spd={target.speed_kt:.1f}kt | v7 addr={t7.addr_hex})")
+          f"alt={target.altitude_m:.0f}m spd={target.speed_kt:.1f}kt | v7 addr={t7.addr_hex} | "
+          f"ADS-L addr={tl.addr_hex} lat={tl.latitude:.5f} lon={tl.longitude:.5f} alt={tl.altitude_m:.0f}m)")
 
 
 if __name__ == "__main__":

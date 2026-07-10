@@ -121,12 +121,13 @@ Se Windows vede solo il disco/seriale o non mostra nessun dispositivo ADALM-Plut
 Default di progetto:
 
 ```text
-center frequency: 1090 MHz
-sample rate:      4.0 MS/s
-RF bandwidth:     2.8 MHz
-gain mode:        manual con adattamento software lento
-gain iniziale:    35 dB
-gain range auto:  5-52 dB
+center frequency:    1090 MHz (ADS-B) / 868.2 MHz (FLARM/ADS-L)
+sample rate:         4.0 MS/s
+RF bandwidth ADS-B:  2.8 MHz
+RF bandwidth FLARM:  300 kHz (canale 868, anche ADS-L)
+gain mode:           manual con adattamento software lento
+gain iniziale:       35 dB
+gain range auto:     5-52 dB
 ```
 
 Esempi:
@@ -139,6 +140,10 @@ npm start -- --source pluto --sample-rate 4000000 --rf-bandwidth 3200000 --gain-
 ```
 
 Il sample rate resta a `4 MS/s` per avere due campioni su ogni mezzo bit ADS-B da `0.5 us`. La bandwidth RF default `2.8 MHz` tiene basso il rumore fuori banda senza restringere troppo i fronti dei pulse.
+
+La banda RF e per-protocollo: quando lo scan passa sul canale `868.2 MHz` il filtro analogico si stringe a `--flarm-rf-bandwidth` (default `300 kHz`, il minimo utile: FLARM e ADS-L occupano ~250 kHz con 2-FSK 100 kchip/s e deviazione +/-50 kHz), poi torna a `2.8 MHz` sul canale 1090. Le bande vengono comunque vincolate al sample rate (Nyquist): non ha senso una banda analogica piu larga del campionamento.
+
+Sul canale 868 il decoder estrae sia i pacchetti FLARM Legacy (v6/v7) sia i beacon **ADS-L** (EASA SRD-860, iConspicuity): stesso PHY, cambia syncword, scrambling XXTEA e CRC-24. I contatti ADS-L compaiono in mappa con prefisso `AL`, quelli FLARM con `FL`.
 
 Con TCXO `0.1 ppm`, l'errore nominale a `1090 MHz` e circa `109 Hz`, quindi il margine RF serve principalmente a preservare la forma del segnale ADS-B, non a coprire drift dell'oscillatore.
 
