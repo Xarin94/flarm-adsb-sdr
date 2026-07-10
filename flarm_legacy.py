@@ -45,12 +45,16 @@ LEGACY_SYNCWORD = bytes((0x55, 0x99, 0xA5, 0xA9, 0x55, 0x66, 0x65, 0x96))
 LEGACY_PAYLOAD_SIZE = 24
 LEGACY_CRC_SIZE = 2
 
-# --- ADS-L (EASA SRD-860): stesso PHY del Legacy (2-FSK 100 kchip/s, +/-50 kHz,
-# Manchester, payload invertito), cambia solo il framing. Costanti da SoftRF
-# (ADSL.h/ADSL.cpp) e dalla classe ADSL_Packet di pjalocha (adsl.h):
-#   syncword on-air = Manchester(0xF5 0x72 'r' 0x4B 'K' 0x18=Length)
-#   frame dopo il sync = Version(1) + 5 word scrambled XXTEA-key0 (20) + CRC24(3)
+# --- ADS-L (EASA ADS-L.4.SRD860): stesso PHY del Legacy (2-GFSK 100 kchip/s,
+# +/-50 kHz, Manchester IEEE 1->"01"/0->"10" per C.2.1), cambia il framing.
+# A differenza del Legacy la specifica NON prevede l'inversione del payload:
+# Sync Word, Payload e CRC vanno in aria Manchester dei byte diretti. Layout
+# del pacchetto dalla classe ADSL_Packet di pjalocha (adsl.h) e da SoftRF:
+#   on-air dopo il preambolo = Manchester(0x72 0x4B sync + 0x18 Length)
+#   frame dopo il Length = Version(1) + 5 word scrambled XXTEA-key0 (20) + CRC24(3)
 #   CRC-24 Mode-S (poly 0xFFF409) calcolato sui 21 byte Version+payload
+# (il "0xF5" spesso citato nel syncword e' solo la coda del preambolo:
+#  ...0101 + "1001 1001" = chip 0x55 0x99)
 ADSL_SYNCWORD = bytes((0x55, 0x99, 0x95, 0xA6, 0x9A, 0x65, 0xA9, 0x6A))
 ADSL_FRAME_SIZE = 24
 ADSL_CRC_SIZE = 3
@@ -519,9 +523,9 @@ def _adsl_addr_type(addr_table: int) -> int:
 
 
 def decode_adsl(frame: bytes) -> Optional[FlarmTarget]:
-    """Decodifica un frame ADS-L di 24 byte (Version + payload + CRC24), gia'
-    de-invertito. Le coordinate sono assolute (FANET cordic): non servono
-    posizione di riferimento ne' timestamp."""
+    """Decodifica un frame ADS-L di 24 byte (Version + payload + CRC24) in
+    byte diretti come da specifica. Le coordinate sono assolute (FANET
+    cordic): non servono posizione di riferimento ne' timestamp."""
     if len(frame) < ADSL_FRAME_SIZE:
         return None
     frame = bytes(frame[:ADSL_FRAME_SIZE])
@@ -753,15 +757,14 @@ class FlarmLegacyReceiver:
             data = self._demod_frame(disc, sync_end, self.adsl_frame_chips, polarity)
             if data is None or len(data) < ADSL_FRAME_SIZE:
                 continue
-            # In aria esistono entrambe le polarita' del payload: SoftRF marca
-            # ADS-L come RF_PAYLOAD_INVERTED (frame trasmesso invertito, come
-            # il Legacy), mentre altri tracker (es. RAK4631/SX1262 con encode
-            # Manchester IEEE diretto) trasmettono i byte non invertiti. Il
-            # sync on-air e' identico nei due casi; il CRC-24 seleziona la
-            # polarita' corretta.
-            frame = bytes(data[:ADSL_FRAME_SIZE])
+            # Per specifica (C.2.1) il frame ADS-L va in aria NON invertito:
+            # _demod_frame de-inverte (convenzione Legacy), quindi la lettura
+            # conforme e' il complemento. Si tenta comunque anche la polarita'
+            # invertita come fallback per implementazioni derivate dal driver
+            # Legacy; il sync on-air e' identico e il CRC-24 discrimina.
+            frame = bytes(b ^ 0xFF for b in data[:ADSL_FRAME_SIZE])
             if crc_adsl(frame) != 0:
-                frame = bytes(b ^ 0xFF for b in frame)
+                frame = bytes(data[:ADSL_FRAME_SIZE])
             if crc_adsl(frame) == 0:
                 result.crc_ok += 1
                 result.adsl_frames.append(frame)
@@ -826,8 +829,9 @@ def modulate(payload: bytes, sample_rate: int, noise_amp: float = 0.0,
 
 
 def modulate_adsl(frame: bytes, sample_rate: int, noise_amp: float = 0.0,
-                  pad: int = 256, invert: bool = True) -> np.ndarray:
-    """Modula un frame ADS-L completo di CRC (per self-test)."""
+                  pad: int = 256, invert: bool = False) -> np.ndarray:
+    """Modula un frame ADS-L completo di CRC (per self-test). Il default
+    invert=False e' la polarita' conforme alla specifica (byte diretti)."""
     sps = max(2, int(round(sample_rate / CHIP_RATE_HZ)))
     chips = _chips_from_frame(frame, _ADSL_SYNC_CHIPS, invert=invert)
     symbols = np.where(np.repeat(chips, sps) > 0, 1.0, -1.0).astype(np.float64)
@@ -1030,9 +1034,9 @@ def self_test() -> None:
     assert abs(tl.course_deg - 135.0) < 1.0, f"ADS-L crs {tl.course_deg}"
     assert tl.addr_type == 2 and tl.aircraft_type == 1, "ADS-L addr/acft type"
 
-    # 6b) ADS-L a polarita' diretta (frame non invertito, come i tracker
-    # SX1262 con Manchester IEEE senza inversione): stesso decode.
-    burst_ni = modulate_adsl(frame, sample_rate, noise_amp=0.05, invert=False)
+    # 6b) fallback: polarita' invertita (implementazioni derivate dal
+    # driver Legacy): stesso decode.
+    burst_ni = modulate_adsl(frame, sample_rate, noise_amp=0.05, invert=True)
     iq_ni = (0.03 * (rng.standard_normal(200000) + 1j * rng.standard_normal(200000))).astype(np.complex64)
     iq_ni[70000:70000 + burst_ni.size] += burst_ni
     res_ni = rx.process(iq_ni)
